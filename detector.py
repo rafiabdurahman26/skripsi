@@ -17,7 +17,7 @@ except Exception:
 
 
 class Detector:
-    def __init__(self, model_path, device='auto', conf=0.50, imgsz=640):
+    def __init__(self, model_path, device='auto', conf=0.35, imgsz=640):
         self.model_path = str(model_path)
         self.conf = conf
         self.imgsz = imgsz
