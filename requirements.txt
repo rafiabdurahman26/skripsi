@@ -1,0 +1,2 @@
+-r requirements-core.txt
+onnxruntime==1.28.0

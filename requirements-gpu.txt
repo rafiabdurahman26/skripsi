@@ -1,0 +1,4 @@
+-r requirements-core.txt
+onnxruntime-gpu[cuda,cudnn]==1.28.0
+# 13.6.1.10 belum punya wheel Windows, pin ke versi terakhir yang ada
+nvidia-cublas==13.6.0.2

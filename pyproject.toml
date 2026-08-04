@@ -1,0 +1,26 @@
+[project]
+name = "drone-human-detection"
+version = "1.0.0"
+description = "Deteksi manusia YOLOv8n (ONNX Runtime) terintegrasi DJI Tello controller"
+requires-python = ">=3.11"
+dependencies = [
+    "av>=11,<18",
+    "djitellopy>=2.4.0",
+    "numpy>=2.0",
+    "opencv-python==5.0.0.93",
+]
+
+[project.optional-dependencies]
+# Jalur CPU: berjalan di device tanpa GPU NVIDIA
+cpu = [
+    "onnxruntime==1.28.0",
+]
+# Jalur GPU: bundel runtime CUDA 13 + cuDNN 9 via pip (tanpa mengubah toolkit sistem)
+gpu = [
+    "onnxruntime-gpu[cuda,cudnn]==1.28.0",
+    # ponytail: 13.6.1.10 belum punya wheel Windows, pin ke versi terakhir yang ada
+    "nvidia-cublas==13.6.0.2",
+]
+
+[tool.uv]
+# uv run python main.py --source tello
