@@ -1,0 +1,4 @@
+av>=11,<18
+djitellopy>=2.4.0
+numpy>=2.0
+opencv-python==5.0.0.93
