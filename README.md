@@ -69,3 +69,23 @@ pip install -r requirements-gpu.txt   # atau requirements.txt untuk CPU
 - Kode Tello (`drone.py`, `input_handler.py`, `video_handler.py`, `config.py`)
   diambil utuh dari project `dji-tello` — source asli tidak diubah.
 - Folder `captures/` (hasil rekam) dan `config.json` tidak di-commit.
+
+## Laporan Sesi (Reports)
+
+Setiap run otomatis mencatat dan menulis laporan (mekanisme mengikuti project
+skripsi `drone_e99_face_recognition`: CSV per-sesi + manifest JSON sebagai
+single source, Excel selalu di-rebuild dari source):
+
+```
+reports/
+  inference/session_<ts>/detection_log_<ts>.csv      # per deteksi (ts, conf, bbox, fps)
+                        per_second_<ts>.csv           # agregasi per detik
+                        session_stats_<ts>.csv        # ringkasan sesi
+                        persons_per_second_<ts>.png   # grafik (cv2, tanpa matplotlib)
+  runs/<ts>_detection.json                            # manifest sesi
+  summary/summary_detection.xlsx                      # SessionLog + PerSecond + PlotsGrid
+```
+
+Grafik digambar dengan OpenCV (tanpa matplotlib); satu-satunya dependensi
+tambahan `openpyxl`. XLSX selalu dibangun ulang dari manifest+CSV, tidak pernah
+di-append — file lama tidak perlu di-reset. Self-check: `uv run python reporting.py`.

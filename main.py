@@ -44,26 +44,48 @@ def fps_meter():
 
 
 def run_phone(args, detector):
+    from reporting import SessionReporter, export_summary
     cap = cv2.VideoCapture(args.phone_url)
     if not cap.isOpened():
         print(f'[PHONE] [!] Tidak bisa membuka stream: {args.phone_url}')
         print('        Pastikan HP & laptop di WiFi yang sama dan app IP Webcam aktif.')
         return 1
     print(f'[PHONE] Stream OK. Tekan q untuk keluar.')
+    rep = SessionReporter(args.source, os.path.basename(args.model),
+                          detector.label, args.conf)
     fps = fps_meter()
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        frame, n = detector.annotate(frame)
-        cv2.putText(frame, f'FPS: {next(fps):.1f} | Orang: {n} | {detector.label}',
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.imshow('Deteksi Manusia (YOLOv8n ONNX)', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    cap.release()
-    cv2.destroyAllWindows()
+    frame_idx = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            frame_idx += 1
+            fpsv = next(fps)
+            dets = detector.detect(frame)
+            frame, n = detector.annotate(frame, dets)
+            rep.add_frame(frame_idx, fpsv, dets)
+            cv2.putText(frame, f'FPS: {fpsv:.1f} | Orang: {n} | {detector.label}',
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.imshow('Deteksi Manusia (YOLOv8n ONNX)', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        _finish_report(rep)
     return 0
+
+
+def _finish_report(rep):
+    """Tutup sesi laporan + rebuild Excel. Gagal laporan tidak menggagalkan run."""
+    try:
+        if rep.finalize():
+            print(f'[REPORT] Laporan sesi tersimpan ({rep.ts})')
+        from reporting import export_summary
+        export_summary()
+    except Exception as e:
+        print(f'[REPORT] [!] Gagal menyimpan laporan: {e}')
 
 
 def run_tello(args, detector):
@@ -71,11 +93,15 @@ def run_tello(args, detector):
     from drone import Drone
     from input_handler import InputHandler
     from video_handler import VideoHandler
+    from reporting import SessionReporter
 
     print_help()
     drone = Drone()
     inp = InputHandler()
     video = VideoHandler()
+    rep = SessionReporter(args.source, os.path.basename(args.model),
+                          detector.label, args.conf)
+    frame_idx = 0
 
     if inp.has_gamepad():
         print('[OK] Gamepad terdeteksi')
@@ -172,14 +198,18 @@ def run_tello(args, detector):
 
             frame = drone.get_frame()
             if frame is not None:
-                frame, n = detector.annotate(frame)
+                frame_idx += 1
+                fpsv = next(fps)
+                dets = detector.detect(frame)
+                frame, n = detector.annotate(frame, dets)
+                rep.add_frame(frame_idx, fpsv, dets)
                 overlay = video.render(
                     frame, battery, drone.is_flying, inp.mode, video.recording,
                     trim_lr, SPEED_MODES[speed_idx], show_grid,
                     drone.get_height(), drone.get_flight_time(), lr, fb, ud, yaw,
                 )
                 h, w = overlay.shape[:2]
-                cv2.putText(overlay, f'PERSON {n} | FPS {next(fps):.0f} | {detector.label}',
+                cv2.putText(overlay, f'PERSON {n} | FPS {fpsv:.0f} | {detector.label}',
                             (w - 230, h - 12), cv2.FONT_HERSHEY_SIMPLEX,
                             0.5, (0, 255, 0), 1)
                 video.write_frame(overlay)
@@ -193,6 +223,7 @@ def run_tello(args, detector):
         save_config(trim_lr, speed_idx)
         drone.disconnect()
         cv2.destroyAllWindows()
+        _finish_report(rep)
         print('[DONE] Disconnected')
     return 0
 

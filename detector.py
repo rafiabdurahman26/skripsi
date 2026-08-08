@@ -129,9 +129,10 @@ class Detector:
         out = self.session.run([self.out_name], {self.in_name: blob})[0]
         return self._postprocess(out, inv_scale)
 
-    def annotate(self, frame, color=(0, 255, 0)):
+    def annotate(self, frame, dets=None, color=(0, 255, 0)):
         """Gambar bounding box. Return (frame_annotated, count)."""
-        dets = self.detect(frame)
+        if dets is None:  # ponytail: dets opsional agar main.py tak double-detect
+            dets = self.detect(frame)
         for x1, y1, x2, y2, c in dets:
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
             cv2.putText(frame, f'{c:.2f}', (int(x1), max(0, int(y1) - 6)),

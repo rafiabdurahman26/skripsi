@@ -8,6 +8,7 @@ dependencies = [
     "djitellopy>=2.4.0",
     "numpy>=2.0",
     "opencv-python==5.0.0.93",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]

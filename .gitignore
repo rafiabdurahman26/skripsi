@@ -14,6 +14,9 @@ config.json
 # Drone captures (photos & videos)
 captures/
 
+# Session reports (CSV, JSON manifest, PNG, Excel summary)
+reports/
+
 # Editor / OS
 *.swp
 *.swo
