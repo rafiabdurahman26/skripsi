@@ -25,7 +25,7 @@ def parse_args():
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description='Deteksi manusia + DJI Tello')
     p.add_argument('--source', choices=['tello', 'phone'], default='tello')
-    p.add_argument('--model', default=os.path.join(here, 'best_model_seed42.onnx'))
+    p.add_argument('--model', default=os.path.join(here, 'best_model.onnx'))
     p.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto')
     p.add_argument('--conf', type=float, default=0.25)
     p.add_argument('--phone-url', default='http://192.168.251.201:8080/video')
