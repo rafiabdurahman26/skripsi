@@ -1,35 +1,37 @@
 """Laporan per sesi deteksi manusia + ringkasan Excel.
 
-Meniru mekanisme reports project skripsi (drone_e99_face_recognition):
-- CSV per-sesi + manifest JSON sebagai single source,
-- Excel summary_detection.xlsx di-build ulang dari source tiap kali (BUKAN append).
+Mengikuti mekanisme reports project skripsi (drone_e99_face_recognition):
+CSV per sesi + manifest JSON sebagai single source; Excel di-rebuild dari
+source tiap kali (tidak pernah di-append).
+
+Fokus laporan (tanpa koordinat bbox):
+- track_id (traking IoU) -> jumlah subjek unik yang benar
+- jumlah subjek terdeteksi, confidence score, ringkasan sesi
 
 Struktur (prefix <ts> = YYYYMMDD_HHMMSS):
-  reports/inference/session_<ts>/detection_log_<ts>.csv    (per deteksi)
-  reports/inference/session_<ts>/per_second_<ts>.csv       (agregasi per detik)
-  reports/inference/session_<ts>/session_stats_<ts>.csv    (ringkasan sesi)
+  reports/inference/session_<ts>/detection_log_<ts>.csv   (ts, frame, track_id, conf, fps)
+  reports/inference/session_<ts>/per_second_<ts>.csv      (agregasi per detik)
+  reports/inference/session_<ts>/subjects_<ts>.csv        (statistik per track/subjek)
+  reports/inference/session_<ts>/session_stats_<ts>.csv   (ringkasan sesi)
   reports/inference/session_<ts>/persons_per_second_<ts>.png
-  reports/runs/<ts>_detection.json                         (manifest)
-  reports/summary/summary_detection.xlsx                   (rebuild tiap run)
+  reports/runs/<ts>_detection.json                        (manifest)
+  reports/summary/summary_detection.xlsx                  (rebuild tiap run)
 
 Pemakaian di main.py:
     rep = SessionReporter(source, model, provider, conf)
-    ... tiap frame: rep.add_frame(dets)   # dets (n,5) x1,y1,x2,y2,conf
+    ... tiap frame: rep.add_frame(frame_idx, fps, dets)   # dets (m,5) x1,y1,x2,y2,conf
     rep.finalize(); export_summary()
 """
 import csv
 import glob
 import json
 import os
-import shutil
-import tempfile
 import time
 from datetime import datetime
 
 import numpy as np
 import cv2
 from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -38,20 +40,104 @@ REPORTS_DIR = os.path.join(ROOT, 'reports')
 RUNS_DIR = os.path.join(REPORTS_DIR, 'runs')
 SUMMARY_DIR = os.path.join(REPORTS_DIR, 'summary')
 
-DETECTION_HEADERS = ['ts', 'frame_idx', 'conf', 'x1', 'y1', 'x2', 'y2', 'fps']
-PER_SECOND_HEADERS = ['second', 'frame_count', 'n_detections',
+DETECTION_HEADERS = ['ts', 'frame_idx', 'track_id', 'conf', 'fps']
+PER_SECOND_HEADERS = ['second', 'frame_count', 'persons', 'n_detections',
                       'mean_conf', 'max_conf', 'avg_fps']
+SUBJECT_HEADERS = ['track_id', 'n_detections', 'mean_conf', 'max_conf',
+                   'first_s', 'last_s', 'coverage_pct']
 STATS_FIELDS = ['source', 'model', 'provider', 'conf_thres', 'duration_s',
-                'frames', 'total_detections', 'max_persons_in_frame',
-                'mean_persons_per_frame', 'mean_conf', 'avg_fps']
+                'frames', 'total_detections', 'unique_subjects',
+                'max_concurrent', 'mean_persons_per_frame', 'mean_conf',
+                'max_conf', 'avg_fps']
+XLSX_DETECTION_HEADERS = ['timestamp', 'session_id', *STATS_FIELDS]
+XLSX_SUBJECT_HEADERS = ['timestamp', 'session_id', *SUBJECT_HEADERS]
+
+TRACK_IOU_THRESH = 0.3
+TRACK_MAX_MISSED = 30   # ~1 detik @30fps sebelum track di-retire
 
 
 def _now_ts():
     return datetime.now().strftime('%Y%m%d_%H%M%S')
 
 
+def _iou(a, b):
+    """IoU dua bbox (x1, y1, x2, y2)."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    aa = (a[2] - a[0]) * (a[3] - a[1])
+    bb = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (aa + bb - inter + 1e-8)
+
+
+class TrackTracker:
+    """Pemberi track_id stabil agar jumlah subjek unik benar.
+
+    Greedy match per deteksi (IoU terhadap track + pool retire), tanpa
+    embedding. ponytail: orang keluar frame >1 dtk lalu kembali di posisi
+    mirip -> id sama; di posisi baru -> id baru.
+    """
+
+    def __init__(self):
+        self.next_id = 1
+        self.tracks = {}    # id -> {'bbox': [x1,y1,x2,y2], 'missed': int}
+        self.retired = []   # [(id, last_bbox)] pool re-ID posisi setelah miss
+        self.stats = {}     # id -> {n, sum_conf, max_conf, first, last} (detik)
+
+    def update(self, boxes, confs, sec):
+        """Match deteksi satu frame -> list track_id sejajar boxes."""
+        used = set()
+        active = []
+        for bbox, c in zip(boxes, confs):
+            best, best_iou = None, 0.0
+            for tid, t in self.tracks.items():
+                if tid in used:
+                    continue
+                i = _iou(bbox, t['bbox'])
+                if i > best_iou:
+                    best_iou, best = i, tid
+            if best is None or best_iou < TRACK_IOU_THRESH:
+                best, best_iou = None, 0.0
+                for tid, rbox in self.retired:
+                    i = _iou(bbox, rbox)
+                    if i > best_iou:
+                        best_iou, best = i, tid
+                if best is not None and best_iou >= TRACK_IOU_THRESH:
+                    self.retired = [(i, b) for i, b in self.retired if i != best]
+                else:
+                    best = self.next_id
+                    self.next_id += 1
+            self.tracks[best] = {'bbox': [float(v) for v in bbox], 'missed': 0}
+            used.add(best)
+            st = self.stats.setdefault(best, {'n': 0, 'sum_conf': 0.0,
+                                              'max_conf': 0.0,
+                                              'first': sec, 'last': sec})
+            st['n'] += 1
+            st['sum_conf'] += float(c)
+            st['max_conf'] = max(st['max_conf'], float(c))
+            st['last'] = sec
+            active.append(best)
+
+        for tid in list(self.tracks):
+            if tid in used:
+                continue
+            self.tracks[tid]['missed'] += 1
+            if self.tracks[tid]['missed'] > TRACK_MAX_MISSED:
+                self.retired.append((tid, self.tracks[tid]['bbox']))
+                del self.tracks[tid]
+        return active
+
+    @property
+    def n_unique_subjects(self):
+        return len(self.stats)
+
+    @property
+    def n_detections(self):
+        return sum(st['n'] for st in self.stats.values())
+
+
 class SessionReporter:
-    """Pencatat satu sesi live. add_frame() per frame; finalize() menulis laporan."""
+    """Satu sesi live: add_frame() per frame, finalize() menulis laporan."""
 
     def __init__(self, source, model, provider, conf):
         self.source = source
@@ -60,42 +146,44 @@ class SessionReporter:
         self.conf = conf
         self.ts = _now_ts()
         self.start = time.time()
-        self.per_sec = {}   # detik -> [frames, n_deteksi, sum_conf, max_conf, sum_fps]
+        self.tracker = TrackTracker()
+        self.per_sec = {}
         self.frames = 0
-        self.n_detections = 0
-        self.sum_conf = 0.0
-        self.max_in_frame = 0
         self.sum_in_frame = 0.0
+        self.max_in_frame = 0
+        self.sum_conf = 0.0
         self.fps_sum = 0.0
         self.log_path = None
         self._csv = None
         self.session_stats = None
 
     def add_frame(self, frame_idx, fps, dets):
-        """Satu frame diproses. dets: np.ndarray (m,5) x1,y1,x2,y2,conf (boleh kosong)."""
+        """Satu frame diproses. dets: (m,5) x1,y1,x2,y2,conf (boleh kosong)."""
         sec = int(time.time() - self.start)
-        rec = self.per_sec.setdefault(sec, [0, 0, 0.0, 0.0, 0.0])
-        rec[0] += 1
-        rec[4] += fps
+        rec = self.per_sec.setdefault(
+            sec, {'frames': 0, 'ids': set(), 'n': 0, 'sc': 0.0, 'mx': 0.0, 'fs': 0.0})
+        rec['frames'] += 1
+        rec['fs'] += fps
 
         if self._csv is None:
             self._open_log()
         now = datetime.now()
         ts_str = f'{now.strftime("%H:%M:%S")}.{now.microsecond // 1000:03d}'
-        for x1, y1, x2, y2, c in dets:
-            self._writer.writerow([ts_str, frame_idx, f'{c:.4f}',
-                                   f'{x1:.1f}', f'{y1:.1f}',
-                                   f'{x2:.1f}', f'{y2:.1f}', f'{fps:.1f}'])
-            rec[1] += 1
-            rec[2] += float(c)
-            rec[3] = max(rec[3], float(c))
-            self.n_detections += 1
-            self.sum_conf += float(c)
-
         n = len(dets)
+        if n:
+            ids = self.tracker.update(dets[:, :4].tolist(),
+                                      dets[:, 4].tolist(), sec)
+            for tid, c in zip(ids, dets[:, 4]):
+                self._writer.writerow([ts_str, frame_idx, tid,
+                                       f'{c:.4f}', f'{fps:.1f}'])
+                rec['n'] += 1
+                rec['sc'] += float(c)
+                rec['mx'] = max(rec['mx'], float(c))
+            rec['ids'].update(ids)
+
         self.frames += 1
-        self.max_in_frame = max(self.max_in_frame, n)
         self.sum_in_frame += n
+        self.max_in_frame = max(self.max_in_frame, n)
         self.fps_sum += fps
 
     def _open_log(self):
@@ -107,7 +195,7 @@ class SessionReporter:
         self._writer.writerow(DETECTION_HEADERS)
 
     def finalize(self):
-        """Tutup log + tulis per_second, stats CSV, PNG, manifest. True jika ada data."""
+        """Tutup log; tulis per_second, subjects, stats, PNG, manifest."""
         if self._csv is not None:
             self._csv.close()
             self._csv = None
@@ -115,18 +203,32 @@ class SessionReporter:
             return False
 
         session_dir = os.path.join(REPORTS_DIR, 'inference', f'session_{self.ts}')
+
         per_second_path = os.path.join(session_dir, f'per_second_{self.ts}.csv')
         with open(per_second_path, 'w', newline='') as f:
             w = csv.writer(f)
             w.writerow(PER_SECOND_HEADERS)
             for sec in sorted(self.per_sec):
-                fc, nd, sc, mx, fs = self.per_sec[sec]
-                w.writerow([sec, fc, nd,
-                            round(sc / nd, 4) if nd else 0.0,
-                            round(mx, 4),
-                            round(fs / fc, 2) if fc else 0.0])
+                r = self.per_sec[sec]
+                w.writerow([sec, r['frames'], len(r['ids']), r['n'],
+                            round(r['sc'] / r['n'], 4) if r['n'] else 0.0,
+                            round(r['mx'], 4),
+                            round(r['fs'] / r['frames'], 2) if r['frames'] else 0.0])
+
+        subjects_path = os.path.join(session_dir, f'subjects_{self.ts}.csv')
+        total_secs = max(self.per_sec) + 1
+        with open(subjects_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(SUBJECT_HEADERS)
+            for tid in sorted(self.tracker.stats):
+                st = self.tracker.stats[tid]
+                w.writerow([tid, st['n'],
+                            round(st['sum_conf'] / st['n'], 4) if st['n'] else 0.0,
+                            round(st['max_conf'], 4), st['first'], st['last'],
+                            round((st['last'] - st['first'] + 1) / total_secs * 100, 1)])
 
         dur = time.time() - self.start
+        n_det = self.tracker.n_detections
         stats = {
             'source': self.source,
             'model': self.model,
@@ -134,222 +236,146 @@ class SessionReporter:
             'conf_thres': self.conf,
             'duration_s': round(dur, 2),
             'frames': self.frames,
-            'total_detections': self.n_detections,
-            'max_persons_in_frame': self.max_in_frame,
+            'total_detections': n_det,
+            'unique_subjects': self.tracker.n_unique_subjects,
+            'max_concurrent': self.max_in_frame,
             'mean_persons_per_frame': round(self.sum_in_frame / self.frames, 2),
-            'mean_conf': round(self.sum_conf / self.n_detections, 4)
-                         if self.n_detections else 0.0,
+            'mean_conf': round(self.sum_conf / n_det, 4) if n_det else 0.0,
+            'max_conf': round(max(r['mx'] for r in self.per_sec.values()), 4),
             'avg_fps': round(self.fps_sum / self.frames, 2),
         }
+        with open(os.path.join(session_dir, f'session_stats_{self.ts}.csv'),
+                  'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(STATS_FIELDS)
+            w.writerow([stats[f] for f in STATS_FIELDS])
+
+        self._plot_persons(os.path.join(session_dir,
+                                        f'persons_per_second_{self.ts}.png'))
+        self._write_manifest(stats)
         self.session_stats = stats
-        stats_path = os.path.join(session_dir, f'session_stats_{self.ts}.csv')
-        with open(stats_path, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=STATS_FIELDS)
-            w.writeheader()
-            w.writerow(stats)
-
-        png_path = os.path.join(session_dir, f'persons_per_second_{self.ts}.png')
-        _plot_persons(sorted(self.per_sec),
-                      [self.per_sec[s][1] for s in sorted(self.per_sec)],
-                      png_path, self.source)
-
-        manifest = {
-            'timestamp': self.ts,
-            'session_id': f'session_{self.ts}',
-            'source': self.source,
-            'model': self.model,
-            'provider': self.provider,
-            'conf': self.conf,
-            'results': stats,
-            # ponytail: basename cukup — folder sesi sudah unik per <ts>
-            'files': [os.path.basename(p) for p in
-                      (self.log_path, per_second_path, stats_path, png_path)
-                      if p is not None],
-        }
-        os.makedirs(RUNS_DIR, exist_ok=True)
-        manifest_path = os.path.join(RUNS_DIR, f'{self.ts}_detection.json')
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, indent=2, ensure_ascii=False)
+        print(f'[REPORT] sesi selesai: {dur:.2f}s, '
+              f'{self.frames} frame, {n_det} deteksi, '
+              f'{self.tracker.n_unique_subjects} subjek unik')
         return True
 
+    def _plot_persons(self, path):
+        """PNG: jumlah subjek unik per detik (oranye) vs FPS >= 20 (hijau)."""
+        x = sorted(self.per_sec)
+        y = [len(self.per_sec[s]['ids']) for s in x]
+        y_fps = [self.per_sec[s]['fs'] / max(self.per_sec[s]['frames'], 1) for s in x]
+        ymax = max(y) if y else 1
+        H, W = 640, 1080
+        bg = np.full((H, W, 3), 10, np.uint8)
+        l, r, t, b = 70, W - 30, 40, H - 150
+        scale_y = (b - t) / max(ymax, 1)
+        for i, (v, fps) in enumerate(zip(y, y_fps)):
+            xpix = l + (r - l) * i / max(len(x) - 1, 1)
+            hh = max(int(v * scale_y), 1)
+            cv2.rectangle(bg, (int(xpix), b - hh), (int(xpix + 8), b),
+                          (0, 180, 255), -1)
+            if fps >= 20:
+                cv2.line(bg, (int(xpix), b), (int(xpix), b - 24), (60, 120, 60), 1)
+        cv2.putText(bg, f'Subjek unik: {self.tracker.n_unique_subjects}',
+                    (l, H - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        cv2.putText(bg, 'Bar oranye = orang per detik', (l, H - 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 1)
+        cv2.putText(bg, 'Baris hijau = FPS >= 20', (500, H - 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 220, 120), 1)
+        cv2.imwrite(path, bg)
 
-def _plot_persons(secs, series, path, source):
-    """Grafik orang/detik pakai cv2 (tanpa matplotlib)."""
-    W, H = 1000, 460
-    img = np.full((H, W, 3), 255, np.uint8)
-    max_y = max(series) or 1
-    pad = 70
-    if len(secs) < 2:
-        secs = [*secs, secs[-1] + 1 if secs else 1]
-        series = [*series, 0]
-    xs = [pad + (s - min(secs)) * (W - 2 * pad) / (max(secs) - min(secs)) for s in secs]
-    ys = [H - 40 - v * (H - 100) / max_y for v in series]
-    for i in range(len(secs) - 1):
-        x1, y1 = int(xs[i]), int(ys[i])
-        x2, y2 = int(xs[i + 1]), int(ys[i + 1])
-        cv2.line(img, (x1, y1), (x2, y2), (0, 120, 255), 2)
-    step = max(1, len(secs) // 8)
-    for i, s in enumerate(secs):
-        if i % step == 0:
-            cv2.putText(img, str(s), (int(xs[i]) - 10, H - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 80), 1)
-    cv2.putText(img, f'{source} | orang per detik (max {max_y})',
-                (20, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-    cv2.putText(img, 'detik', (25, H - 15), cv2.FONT_HERSHEY_SIMPLEX,
-                0.45, (120, 120, 120), 1)
-    cv2.imwrite(path, img)
-
-
-# ==================== export Excel (rebuild dari source) ================
-
-LOG_HEADERS = ['timestamp', 'session_id', 'source', 'model', 'provider', 'conf',
-               'duration_s', 'frames', 'total_detections', 'max_persons_in_frame',
-               'mean_persons_per_frame', 'mean_conf', 'avg_fps']
-PER_SECOND_HEADERS2 = ['session_id', 'source', 'second', 'frame_count',
-                       'n_detections', 'mean_conf', 'max_conf', 'avg_fps']
-
-
-def _load_manifests():
-    out = []
-    for path in sorted(glob.glob(os.path.join(RUNS_DIR, '*_detection.json'))):
-        try:
-            with open(path, encoding='utf-8') as f:
-                out.append(json.load(f))
-        except (json.JSONDecodeError, OSError):
-            print(f'[WARN] Manifest korup, dilewati: {path}')
-    return out
-
-
-def _session_rows():
-    rows = []
-    for m in _load_manifests():
-        r = m.get('results', {})
-        rows.append([m.get('timestamp'), m.get('session_id'), m.get('source'),
-                     m.get('model'), m.get('provider'), m.get('conf'),
-                     r.get('duration_s'), r.get('frames'),
-                     r.get('total_detections'), r.get('max_persons_in_frame'),
-                     r.get('mean_persons_per_frame'), r.get('mean_conf'),
-                     r.get('avg_fps')])
-    return rows
-
-
-def _per_second_rows():
-    manifests = {m.get('timestamp'): m for m in _load_manifests()}
-    rows = []
-    for path in sorted(glob.glob(os.path.join(REPORTS_DIR, 'inference', '**',
-                                             'per_second_*.csv'), recursive=True)):
-        ts = os.path.basename(path)[len('per_second_'):-len('.csv')]
-        m = manifests.get(ts, {})
-        sid = m.get('session_id', '')
-        src = m.get('source', '')
-        with open(path, newline='') as f:
-            for row in csv.DictReader(f):
-                rows.append((sid, src, int(row['second']),
-                             int(row['frame_count']), int(row['n_detections']),
-                             float(row['mean_conf'] or 0), float(row['max_conf'] or 0),
-                             float(row['avg_fps'] or 0)))
-    return rows
-
-
-def _write_table(ws, headers, rows):
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill('solid', fgColor='D9E1F2')
-    for r, row in enumerate(rows, 2):
-        for c, v in enumerate(row, 1):
-            ws.cell(row=r, column=c, value=v)
-    for c in range(1, len(headers) + 1):
-        vals = [len(str(ws.cell(row=r, column=c).value or ''))
-                for r in range(2, len(rows) + 2)]
-        ws.column_dimensions[get_column_letter(c)].width = \
-            min(max([len(str(headers[c - 1]))] + vals) + 2, 40)
-    ws.freeze_panes = 'A2'
+    def _write_manifest(self, stats):
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        manifest_path = os.path.join(RUNS_DIR, f'{self.ts}_manifest.json')
+        with open(manifest_path, 'w') as f:
+            json.dump({'timestamp': self.ts,
+                       'file_name': f'{self.ts}_manifest.json',
+                       'results': stats}, f, indent=2)
 
 
 def export_summary():
-    """Rebuild reports/summary/summary_detection.xlsx dari manifest + CSV."""
+    """Rebuild summary_detection.xlsx (Deteksi + Subjek) dari manifest & CSV."""
     os.makedirs(SUMMARY_DIR, exist_ok=True)
+    manifests = sorted(glob.glob(os.path.join(RUNS_DIR, '*_manifest.json')),
+                       reverse=True)
+    det_rows, subj_rows = [], []
+    for mpath in manifests:
+        with open(mpath) as f:
+            m = json.load(f)
+        ts = m.get('timestamp', os.path.basename(mpath).split('_')[0])
+        ts_cols = {'timestamp': ts, 'session_id': f'session_{ts}'}
+        det_rows.append({**ts_cols, **m.get('results', {})})
+        subj_csv = os.path.join(REPORTS_DIR, 'inference', f'session_{ts}',
+                                f'subjects_{ts}.csv')
+        if os.path.exists(subj_csv):
+            for row in csv.DictReader(open(subj_csv, newline='')):
+                subj_rows.append({**ts_cols, **row})
+    det_rows = sorted(det_rows, key=lambda r: r['timestamp'])
+
     wb = Workbook()
-    default_sheet = wb.active
-    if default_sheet is not None:
-        wb.remove(default_sheet)
+    ws = wb.active or wb.create_sheet()
+    ws.title = 'Deteksi'
+    _xl_headers(ws, XLSX_DETECTION_HEADERS)
+    for r in det_rows:
+        ws.append([r[h] for h in XLSX_DETECTION_HEADERS])
+    _autofit(ws)
 
-    _write_table(wb.create_sheet('SessionLog'), LOG_HEADERS, _session_rows())
+    if subj_rows:
+        ws2 = wb.create_sheet('Subjek')
+        _xl_headers(ws2, XLSX_SUBJECT_HEADERS)
+        for r in sorted(subj_rows, key=lambda r: r['timestamp']):
+            ws2.append([r[h] for h in XLSX_SUBJECT_HEADERS])
+        _autofit(ws2)
 
-    _write_table(wb.create_sheet('PerSecond'), PER_SECOND_HEADERS2,
-                 _per_second_rows())
+    wb.save(os.path.join(SUMMARY_DIR, 'summary_detection.xlsx'))
+    print(f'[Report] summary_detection.xlsx OK ({len(det_rows)} sesi)')
 
-    ws = wb.create_sheet('PlotsGrid')
-    for c, h in enumerate(['Timestamp', 'Source', 'Plot'], 1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill('solid', fgColor='D9E1F2')
-    ws.column_dimensions['A'].width = 21
-    ws.column_dimensions['B'].width = 8
-    ws.column_dimensions['C'].width = 80
-    manifests = {m.get('timestamp'): m for m in _load_manifests()}
-    r = 2
-    for path in sorted(glob.glob(os.path.join(REPORTS_DIR, 'inference', '**',
-                                             'persons_per_second_*.png'),
-                                recursive=True)):
-        ts = os.path.basename(path)[len('persons_per_second_'):-len('.png')]
-        m = manifests.get(ts, {})
-        ws.cell(row=r, column=1, value=ts)
-        ws.cell(row=r, column=2, value=m.get('source', ''))
-        img = XLImage(path)
-        img.width = 480
-        img.height = int(img.height * 480 / img.width)
-        ws.add_image(img, f'C{r}')
-        ws.row_dimensions[r].height = img.height
-        r += 1
 
-    out = os.path.join(SUMMARY_DIR, 'summary_detection.xlsx')
-    wb.save(out)
-    print(f'[DONE] {out}')
-    return out
+def _xl_headers(ws, headers):
+    fill = PatternFill('solid', fgColor='1F4E78')
+    font = Font(bold=True, color='FFFFFF')
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(1, c, h)
+        cell.fill = fill
+        cell.font = font
+    ws.freeze_panes = 'A2'
+
+
+def _autofit(ws):
+    for col in ws.columns:
+        width = max(len(str(c.value)) for c in col if c.value is not None) + 2
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(width, 60)
 
 
 def _check():
-    # ponytail: satu run-level check — agregasi + finalize roundtrip
-    global REPORTS_DIR, RUNS_DIR, SUMMARY_DIR
-    tmp = tempfile.mkdtemp()
-    old = (REPORTS_DIR, RUNS_DIR, SUMMARY_DIR)
-    REPORTS_DIR, RUNS_DIR, SUMMARY_DIR = (os.path.join(tmp, 'reports'),
-                                          os.path.join(tmp, 'reports', 'runs'),
-                                          os.path.join(tmp, 'reports', 'summary'))
-    try:
-        rep = SessionReporter('test', 'best.onnx', 'CUDA', 0.25)
-        d1 = np.array([[10, 10, 50, 50, 0.9], [100, 100, 150, 150, 0.8]], np.float32)
-        d2 = np.array([[10, 10, 50, 50, 0.7]], np.float32)
-        rep.add_frame(0, 30.0, d1)
-        rep.add_frame(1, 30.0, d2)
-        assert rep.frames == 2
-        assert rep.n_detections == 3
-        assert rep.max_in_frame == 2
-        assert abs(rep.sum_conf - 2.4) < 1e-6  # float32 precision
-        rec = list(rep.per_sec.values())[0]
-        assert rec[0] == 2 and rec[1] == 3
-        assert abs(rec[2] - 2.4) < 1e-6
-        assert abs(rec[3] - 0.9) < 1e-6
-        assert rep.finalize() is True
-        st = rep.session_stats
-        assert st is not None
-        assert st['mean_persons_per_frame'] == 1.5
-        for sub in ('detection_log', 'per_second', 'session_stats'):
-            assert glob.glob(os.path.join(REPORTS_DIR, 'inference',
-                                          f'session_{rep.ts}',
-                                          f'{sub}_{rep.ts}.csv')), sub
-        assert os.path.exists(os.path.join(
-            REPORTS_DIR, 'inference', f'session_{rep.ts}',
-            f'persons_per_second_{rep.ts}.png'))
-        assert glob.glob(os.path.join(RUNS_DIR, f'{rep.ts}_detection.json'))
-        export_path = export_summary()
-        assert os.path.exists(export_path)
-        print('[CHECK] SessionReporter agregasi + finalize + export OK')
-    finally:
-        REPORTS_DIR, RUNS_DIR, SUMMARY_DIR = old
-        shutil.rmtree(tmp, ignore_errors=True)
+    # ponytail: satu runnable check - tracker memberi id berulang stabil, dan
+    #          reporter menulis laporan yang konsisten (2 detik simulasi)
+    t = TrackTracker()
+    ids1 = t.update([[0, 0, 50, 50]], [0.9], 0)
+    ids2 = t.update([[3, 3, 53, 53]], [0.8], 0)   # geser 3px -> masih 1 orang
+    assert ids1 == ids2 and t.n_unique_subjects == 1, 're-ID gagal untuk 1 orang'
+    ids3 = t.update([[300, 300, 360, 360]], [0.6], 1)
+    assert len(set(ids3)) == 1 and ids3[0] != ids2[0], 'orang baru harus id baru'
+    assert t.n_unique_subjects == 2 and t.n_detections == 3
+    print('[CHECK] tracker OK')
+
+    r = SessionReporter('tello', 'm.onnx', 'CUDAExecutionProvider', 0.25)
+    r.add_frame(0, 30.0, np.array([[0, 0, 50, 50, 0.9]], np.float32))
+    r.add_frame(1, 30.0, np.array([[3, 3, 53, 53, 0.8]], np.float32))
+    r.add_frame(2, 30.0, np.array([], np.float32).reshape(0, 5))
+    assert r.finalize() and r.session_stats is not None
+    assert r.session_stats['unique_subjects'] == 1
+    assert r.session_stats['total_detections'] == 2
+    per_sec = csv.DictReader(open(
+        os.path.join(REPORTS_DIR, 'inference', f'session_{r.ts}',
+                     f'per_second_{r.ts}.csv'), newline=''))
+    rows = list(per_sec)
+    assert rows and rows[0]['persons'] == '1', f'persons per detik salah: {rows}'
+    manifest = glob.glob(os.path.join(RUNS_DIR, f'{r.ts}_manifest.json'))
+    assert manifest, 'manifest tidak ditulis'
+    export_summary()
+    assert os.path.exists(os.path.join(SUMMARY_DIR, 'summary_detection.xlsx'))
+    print('[CHECK] reporter OK')
 
 
 if __name__ == '__main__':

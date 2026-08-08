@@ -28,6 +28,8 @@ def parse_args():
     p.add_argument('--model', default=os.path.join(here, 'best_model.onnx'))
     p.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto')
     p.add_argument('--conf', type=float, default=0.25)
+    p.add_argument('--input', choices=['raw', 'norm'], default='raw',
+                   help='raw: feed 0-255 (best_model.onnx); norm: bagi 255 (model gaya ultralytics)')
     p.add_argument('--phone-url', default='http://192.168.251.201:8080/video')
     return p.parse_args()
 
@@ -261,7 +263,8 @@ def main():
     if not os.path.exists(args.model):
         print(f'[DETECT] [!] Model tidak ditemukan: {args.model}')
         return 1
-    detector = Detector(args.model, device=args.device, conf=args.conf)
+    detector = Detector(args.model, device=args.device, conf=args.conf,
+                        raw_input=args.input == 'raw')
     print(f'[DETECT] Model dimuat | provider: {detector.device}')
 
     if args.source == 'tello':

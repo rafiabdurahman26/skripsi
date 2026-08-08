@@ -32,9 +32,10 @@ Tanpa uv, pakai `.venv\Scripts\python.exe main.py ...`.
 | Opsi | Nilai | Default | Keterangan |
 |---|---|---|---|
 | `--source` | `tello` / `phone` | `tello` | Sumber video |
-| `--model` | path `.onnx` | `best_model_seed42.onnx` | Model deteksi |
+| `--model` | path `.onnx` | `best_model.onnx` | Model deteksi |
 | `--device` | `auto` / `cuda` / `cpu` | `auto` | Paksa provider |
 | `--conf` | 0.0–1.0 | `0.25` | Ambang confidence |
+| `--input` | `raw` / `norm` | `raw` | `raw`: feed 0–255 (model sendiri); `norm`: bagi 255 (model gaya ultralytics) |
 | `--phone-url` | URL | lihat `config.py` | URL MJPEG IP Webcam |
 
 Selama live stream: `q`/`Q` quit, `t` takeoff/land. Overlay deteksi (kotak + jumlah
@@ -78,14 +79,19 @@ single source, Excel selalu di-rebuild dari source):
 
 ```
 reports/
-  inference/session_<ts>/detection_log_<ts>.csv      # per deteksi (ts, conf, bbox, fps)
-                        per_second_<ts>.csv           # agregasi per detik
+  inference/session_<ts>/detection_log_<ts>.csv      # per deteksi (ts, frame, track_id, conf, fps)
+                        per_second_<ts>.csv           # agregasi per detik (persons, conf, fps)
+                        subjects_<ts>.csv             # statistik per subjek (track_id)
                         session_stats_<ts>.csv        # ringkasan sesi
                         persons_per_second_<ts>.png   # grafik (cv2, tanpa matplotlib)
-  runs/<ts>_detection.json                            # manifest sesi
-  summary/summary_detection.xlsx                      # SessionLog + PerSecond + PlotsGrid
+  runs/<ts>_manifest.json                             # manifest sesi
+  summary/summary_detection.xlsx                      # Sheet Deteksi + Sheet Subjek
 ```
 
-Grafik digambar dengan OpenCV (tanpa matplotlib); satu-satunya dependensi
-tambahan `openpyxl`. XLSX selalu dibangun ulang dari manifest+CSV, tidak pernah
-di-append — file lama tidak perlu di-reset. Self-check: `uv run python reporting.py`.
+Laporan tanpa koordinat bbox: jumlah subjek dihitung lewat **tracking IoU**
+(`track_id`) sehingga orang yang sama tidak dihitung ganda; confidence
+dirangkum (mean/max) per detik, per subjek, dan per sesi. Grafik digambar
+dengan OpenCV (tanpa matplotlib); satu-satunya dependensi tambahan
+`openpyxl`. XLSX selalu dibangun ulang dari manifest+CSV, tidak pernah
+di-append — file lama tidak perlu di-reset. Self-check:
+`uv run python reporting.py`.
