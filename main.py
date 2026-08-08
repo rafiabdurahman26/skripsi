@@ -24,12 +24,14 @@ from detector import Detector
 def parse_args():
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description='Deteksi manusia + DJI Tello')
-    p.add_argument('--source', choices=['tello', 'phone'], default='tello')
+    p.add_argument('--source', choices=['tello', 'phone', 'webcam'], default='tello')
     p.add_argument('--model', default=os.path.join(here, 'best_model.onnx'))
     p.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto')
     p.add_argument('--conf', type=float, default=0.25)
-    p.add_argument('--input', choices=['raw', 'norm'], default='raw',
-                   help='raw: feed 0-255 (best_model.onnx); norm: bagi 255 (model gaya ultralytics)')
+    p.add_argument('--camera', type=int, default=0,
+                   help='index webcam (0, 1, ...) untuk --source webcam')
+    p.add_argument('--input', choices=['raw', 'norm'], default='norm',
+                   help='norm: bagi 255 (default, model YOLO26 end2end); raw: feed 0-255 (model ekspor klasik)')
     p.add_argument('--phone-url', default='http://192.168.251.201:8080/video')
     return p.parse_args()
 
@@ -47,12 +49,20 @@ def fps_meter():
 
 def run_phone(args, detector):
     from reporting import SessionReporter, export_summary
-    cap = cv2.VideoCapture(args.phone_url)
-    if not cap.isOpened():
-        print(f'[PHONE] [!] Tidak bisa membuka stream: {args.phone_url}')
-        print('        Pastikan HP & laptop di WiFi yang sama dan app IP Webcam aktif.')
-        return 1
-    print(f'[PHONE] Stream OK. Tekan q untuk keluar.')
+    if args.source == 'webcam':
+        cap = cv2.VideoCapture(args.camera)
+        if not cap.isOpened():
+            print(f'[CAM] [!] Tidak bisa membuka kamera index {args.camera}')
+            print('        Cek kabel/permission; coba index lain: --camera 1')
+            return 1
+        print(f'[CAM] Webcam {args.camera} OK. Tekan q untuk keluar.')
+    else:
+        cap = cv2.VideoCapture(args.phone_url)
+        if not cap.isOpened():
+            print(f'[PHONE] [!] Tidak bisa membuka stream: {args.phone_url}')
+            print('        Pastikan HP & laptop di WiFi yang sama dan app IP Webcam aktif.')
+            return 1
+        print(f'[PHONE] Stream OK. Tekan q untuk keluar.')
     rep = SessionReporter(args.source, os.path.basename(args.model),
                           detector.label, args.conf)
     fps = fps_meter()
@@ -67,7 +77,8 @@ def run_phone(args, detector):
             dets = detector.detect(frame)
             frame, n = detector.annotate(frame, dets)
             rep.add_frame(frame_idx, fpsv, dets)
-            cv2.putText(frame, f'FPS: {fpsv:.1f} | Orang: {n} | {detector.label}',
+            title = f'Webcam {args.camera}' if args.source == 'webcam' else 'Phone (IP Webcam)'
+            cv2.putText(frame, f'FPS: {fpsv:.1f} | Orang: {n} | {detector.label} | {title}',
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             cv2.imshow('Deteksi Manusia (YOLOv8n ONNX)', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):

@@ -17,7 +17,7 @@ except Exception:
 
 
 class Detector:
-    def __init__(self, model_path, device='auto', conf=0.35, imgsz=640, raw_input=True):
+    def __init__(self, model_path, device='auto', conf=0.35, imgsz=640, raw_input=False):
         self.model_path = str(model_path)
         self.conf = conf
         self.imgsz = imgsz
@@ -82,6 +82,7 @@ class Detector:
         """Return np.ndarray (n,5): x1, y1, x2, y2, conf."""
         blob, inv_scale = self._preprocess(frame)
         out = self.session.run([self.out_name], {self.in_name: blob})[0]
+        out = np.asarray(out)  # view tanpa copy; menormalkan tipe untuk typing
         if len(out.shape) == 3 and out.shape[2] == 6:
             return self._postprocess_boxes(out, inv_scale)   # NMS sudah di graph
         return self._postprocess_grid(out, inv_scale)        # (1, 5+cls, N)

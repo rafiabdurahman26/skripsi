@@ -23,6 +23,8 @@ Jalankan:
 ```
 uv run python main.py --source tello   # drone Tello (default)
 uv run python main.py --source phone   # kamera HP (IP Webcam)
+uv run python main.py --source webcam  # webcam laptop (device 0)
+uv run python main.py --source webcam --camera 1   # webcam kedua
 ```
 
 Tanpa uv, pakai `.venv\Scripts\python.exe main.py ...`.
@@ -31,11 +33,12 @@ Tanpa uv, pakai `.venv\Scripts\python.exe main.py ...`.
 
 | Opsi | Nilai | Default | Keterangan |
 |---|---|---|---|
-| `--source` | `tello` / `phone` | `tello` | Sumber video |
+| `--source` | `tello` / `phone` / `webcam` | `tello` | Sumber video |
+| `--camera` | int | `0` | Index webcam untuk `--source webcam` (0, 1, ...) |
 | `--model` | path `.onnx` | `best_model.onnx` | Model deteksi |
 | `--device` | `auto` / `cuda` / `cpu` | `auto` | Paksa provider |
 | `--conf` | 0.0–1.0 | `0.25` | Ambang confidence |
-| `--input` | `raw` / `norm` | `raw` | `raw`: feed 0–255 (model sendiri); `norm`: bagi 255 (model gaya ultralytics) |
+| `--input` | `raw` / `norm` | `norm` | `norm`: bagi 255 (default, model YOLO26 end2end); `raw`: feed 0–255 (model ekspor klasik) |
 | `--phone-url` | URL | lihat `config.py` | URL MJPEG IP Webcam |
 
 Selama live stream: `q`/`Q` quit, `t` takeoff/land. Overlay deteksi (kotak + jumlah
@@ -63,6 +66,14 @@ pip install -r requirements-gpu.txt   # atau requirements.txt untuk CPU
   `cudnn_conv_algo_search=EXHAUSTIVE` (≈3x lebih cepat dari default) + buffer
   blob/letterbox yang di-reuse — hasil: **±82 FPS end-to-end** di RTX 2050.
   Provider aktif terlihat live di HUD (`PERSON n | FPS xx | CUDA`).
+- Model `best_model.onnx` adalah **YOLO26n ekspor end2end ultralytics**
+  (`end2end: True`, output `(1, 300, 6)` = `x1,y1,x2,y2,conf,cls`, tanpa NMS di
+  graph). Graph ini **tidak punya node `/255` internal** → input wajib
+  dinormalisasi 0–1 (`--input norm`, default). Umpan 0–255 membuat sigmoid
+  jenuh: ratusan kotak acak conf ~1.0 di semua frame — gejala "banyak bbox"
+  yang pernah muncul. Konvensi kanal RGB (flip BGR→RGB) sama dengan pipeline
+  ultralytics (val model: mAP50 0.78, demo video 8–47 deteksi/frame, conf
+  rata-rata 0.49).
 - GPU runtime (CUDA 13 + cuDNN 9) ikut ter-install **di dalam venv** via
   `onnxruntime-gpu[cuda,cudnn]`; toolkit CUDA 12.1 sistem dan project lain tidak
   disentuh. `nvidia-cublas` di-pin `13.6.0.2` (versi terbaru tidak punya wheel
